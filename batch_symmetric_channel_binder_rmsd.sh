@@ -5,6 +5,10 @@ PYTHON_SCRIPT="compute_symmetric_channel_binder_rmsd.py"
 TARGET_SEQ="IPDAFWWAVVTMTTVGYGD"
 OUTPUT_FILE="analysis_results.csv"
 
+# Automatically detect number of CPU cores
+NUM_PROCESSES=$(python3 -c "import multiprocessing as mp; print(mp.cpu_count())")
+echo "Detected $NUM_PROCESSES CPU cores"
+
 # Function to print usage
 usage() {
     echo "Usage: $0 [options]"
@@ -16,6 +20,7 @@ usage() {
     echo "  -p, --python-script PATH  Path to the Python script (default: $PYTHON_SCRIPT)"
     echo "  -s, --sequence SEQ       Target sequence (default: $TARGET_SEQ)"
     echo "  -o, --output FILE        Output CSV file (default: $OUTPUT_FILE)"
+    echo "  -n, --num-processes N    Number of parallel processes (default: auto-detected = $NUM_PROCESSES)"
     echo "  -h, --help              Show this help message"
     exit 1
 }
@@ -47,6 +52,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_FILE="$2"
             shift 2
             ;;
+        -n|--num-processes)
+            NUM_PROCESSES="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -75,8 +84,15 @@ if [ ! -f "$PYTHON_SCRIPT" ]; then
     exit 1
 fi
 
+# Create temporary directory for parallel processing
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
 # Create output CSV header
 echo "Model,AF_Version,Binder_RMSD,Channel_RMSD,Binder_Length_Ref,Binder_Length_Model,Channel_Length,Reference_Path,Model_Path" > "$OUTPUT_FILE"
+
+# Create a lock file for atomic writes to the output file
+exec {LOCKFD}>"$TEMP_DIR/output.lock"
 
 # Function to find reference file
 find_reference() {
@@ -86,83 +102,98 @@ find_reference() {
     find "$REF_DIR" -type f -path "*/$ref_pattern" -print -quit
 }
 
-# Function to extract model and sample numbers
-extract_numbers() {
-    local filename="$1"
-    local af_version="$2"
-    local model_num=""
-    local sample_num=""
-
-    if [[ $af_version == "AF2" ]]; then
-        model_num=$(echo "$filename" | grep -o '_[0-9]\+_sample_[0-9]\+_' | cut -d'_' -f2)
-        sample_num=$(echo "$filename" | grep -o '_sample_[0-9]\+_' | cut -d'_' -f3)
-    else  # AF3
-        model_num=$(echo "$filename" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f2)
-        sample_num=$(echo "$filename" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f3)
-    fi
-
-    echo "$model_num $sample_num"
+# Function to safely write to output file
+safe_write() {
+    flock $LOCKFD echo "$1" >> "$OUTPUT_FILE"
 }
 
-# Process model function
+# Function to process a single model
 process_model() {
     local model_path="$1"
     local af_version="$2"
     local model_name=$(basename "$model_path")
+    local process_num="$3"
 
-    # Extract model and sample numbers
-    read -r model_num sample_num <<< "$(extract_numbers "$model_name" "$af_version")"
+    # Extract model and sample numbers based on AF version
+    if [[ "$af_version" == "AF2" ]]; then
+        model_num=$(echo "$model_name" | grep -o '_[0-9]\+_sample_[0-9]\+_' | cut -d'_' -f2)
+        sample_num=$(echo "$model_name" | grep -o '_sample_[0-9]\+_' | cut -d'_' -f3)
+    else
+        model_num=$(echo "$model_name" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f2)
+        sample_num=$(echo "$model_name" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f3)
+    fi
 
     if [ -z "$model_num" ] || [ -z "$sample_num" ]; then
-        echo "Warning: Could not extract model/sample numbers from $model_name"
+        echo "Process $process_num: Warning - Could not extract model/sample numbers from $model_name"
         return
     fi
 
-    # Find corresponding reference
     reference_path=$(find_reference "$model_num" "$sample_num")
 
     if [ -z "$reference_path" ]; then
-        echo "Warning: No reference found for model $model_name"
+        echo "Process $process_num: Warning - No reference found for model $model_name"
         return
     fi
 
-    echo "Processing $af_version model ${model_num}_${sample_num}..."
+    echo "Process $process_num: Processing ${af_version} model ${model_num}_${sample_num}..."
 
-    # Run the Python script and capture output
-    output=$(python3 "$PYTHON_SCRIPT" \
+    # Create a temporary output file for this model
+    local temp_output="$TEMP_DIR/output_${process_num}_${model_num}_${sample_num}"
+
+    # Run analysis
+    python3 "$PYTHON_SCRIPT" \
         -refpdb "$reference_path" \
         -testpdb "$model_path" \
-        -targetseq "$TARGET_SEQ" \
-        -v)
+        -targetseq "$TARGET_SEQ" > "$temp_output" 2>&1
 
-    # Check if the Python script executed successfully
-    if [ $? -ne 0 ]; then
-        echo "Warning: Analysis failed for model $model_name"
-        return
+    # Extract results and write to CSV if successful
+    if [ $? -eq 0 ]; then
+        binder_rmsd=$(tail -n 6 "$temp_output" | grep "Binder RMSD:" | awk '{print $3}')
+        channel_rmsd=$(tail -n 5 "$temp_output" | grep "Channel RMSD:" | awk '{print $3}')
+        binder_length_ref=$(tail -n 4 "$temp_output" | grep "Binder length (reference):" | awk '{print $4}')
+        binder_length_model=$(tail -n 3 "$temp_output" | grep "Binder length (test):" | awk '{print $4}')
+        channel_length=$(tail -n 2 "$temp_output" | grep "Channel length:" | awk '{print $3}')
+
+        safe_write "${model_num}_${sample_num},$af_version,$binder_rmsd,$channel_rmsd,$binder_length_ref,$binder_length_model,$channel_length,$reference_path,$model_path"
+    else
+        echo "Process $process_num: Warning - Analysis failed for model $model_name"
     fi
 
-    # Extract values from output
-    binder_rmsd=$(echo "$output" | grep "Binder RMSD:" | awk '{print $3}')
-    channel_rmsd=$(echo "$output" | grep "Channel RMSD:" | awk '{print $3}')
-    binder_length_ref=$(echo "$output" | grep "Binder length (reference):" | awk '{print $4}')
-    binder_length_model=$(echo "$output" | grep "Binder length (test):" | awk '{print $4}')
-    channel_length=$(echo "$output" | grep "Channel length:" | awk '{print $3}')
-
-    # Add to CSV
-    echo "${model_num}_${sample_num},$af_version,$binder_rmsd,$channel_rmsd,$binder_length_ref,$binder_length_model,$channel_length,$reference_path,$model_path" >> "$OUTPUT_FILE"
+    rm -f "$temp_output"
 }
 
-# Process AF2 models
-echo "Processing AF2 models..."
-find "$AF2_DIR" -type f -name "*.pdb" | while read -r model_path; do
-    process_model "$model_path" "AF2"
-done
+export -f process_model
+export -f find_reference
+export -f safe_write
+export LOCKFD
+export TEMP_DIR
+export OUTPUT_FILE
+export PYTHON_SCRIPT
+export TARGET_SEQ
+export REF_DIR
 
-# Process AF3 models
-echo "Processing AF3 models..."
-find "$AF3_DIR" -type f -name "*.cif" | while read -r model_path; do
-    process_model "$model_path" "AF3"
-done
+# Create list of all models
+echo "Creating model list..."
+{
+    find "$AF2_DIR" -type f -name "*.pdb" -printf '%p,AF2\n'
+    find "$AF3_DIR" -type f -name "*.cif" -printf '%p,AF3\n'
+} > "$TEMP_DIR/all_models.txt"
+
+total_models=$(wc -l < "$TEMP_DIR/all_models.txt")
+echo "Total models to process: $total_models"
+echo "Using $NUM_PROCESSES parallel processes"
+
+# Process all models in parallel using GNU Parallel
+if command -v parallel >/dev/null 2>&1; then
+    # Use GNU Parallel if available
+    parallel --progress --jobs "$NUM_PROCESSES" \
+        process_model {1} {2} {#} :::: "$TEMP_DIR/all_models.txt" --colsep ','
+else
+    # Fallback to xargs if GNU Parallel is not available
+    export MAX_PROCS=$NUM_PROCESSES
+    cat "$TEMP_DIR/all_models.txt" | xargs -P "$NUM_PROCESSES" -I{} bash -c \
+        'IFS=","; set -- {}; process_model "$1" "$2" "$$"'
+fi
 
 echo "Analysis complete. Results saved to $OUTPUT_FILE"
 
