@@ -68,8 +68,47 @@ class ChannelBinderAnalyzer:
                              for res in chain.get_residues()
                              if res.id[0] == ' ' and res.get_resname().strip() in three_to_one)
             sequences[chain.id] = sequence
+            logger.info(f"Chain {chain.id} sequence: {sequence}")
             logger.info(f"Chain {chain.id} sequence length: {len(sequence)}")
         return sequences
+
+    def find_best_sequence_match(self, sequence: str, target: str) -> Optional[int]:
+        """Find the best matching position of target sequence in main sequence."""
+        def calculate_similarity(seq1: str, seq2: str) -> float:
+            """Calculate sequence similarity score."""
+            if len(seq1) != len(seq2):
+                return 0.0
+            matches = sum(1 for a, b in zip(seq1, seq2) if a == b)
+            return matches / len(seq1)
+
+        target = target.upper()
+        sequence = sequence.upper()
+
+        # Try exact match first
+        exact_match = sequence.find(target)
+        if exact_match != -1:
+            logger.info(f"Found exact sequence match at position {exact_match}")
+            return exact_match
+
+        # Try with flexible matching
+        best_score = 0.0
+        best_position = -1
+        target_length = len(target)
+
+        for i in range(len(sequence) - target_length + 1):
+            window = sequence[i:i + target_length]
+            score = calculate_similarity(window, target)
+            logger.debug(f"Position {i}: {window} -> similarity score: {score:.2f}")
+            if score > best_score and score > 0.8:  # 80% similarity threshold
+                best_score = score
+                best_position = i
+
+        if best_position != -1:
+            logger.info(f"Found best sequence match at position {best_position} with {best_score:.2f} similarity")
+            logger.info(f"Matched sequence: {sequence[best_position:best_position + target_length]}")
+            return best_position
+
+        return None
 
     def identify_chains(self, structure: PDB.Structure.Structure,
                        target_sequence: str) -> ChainMapping:
@@ -78,10 +117,14 @@ class ChannelBinderAnalyzer:
 
         # Find channel chain (contains target sequence)
         channel_chain = None
+        best_match_position = None
+
         for chain_id, sequence in sequences.items():
-            if target_sequence in sequence:
+            match_position = self.find_best_sequence_match(sequence, target_sequence)
+            if match_position is not None:
                 channel_chain = chain_id
-                logger.info(f"Found channel sequence in chain {chain_id}")
+                best_match_position = match_position
+                logger.info(f"Found channel sequence in chain {chain_id} at position {match_position}")
                 break
 
         if not channel_chain:
@@ -105,13 +148,13 @@ class ChannelBinderAnalyzer:
 
             if target_sequence:
                 sequence = self.get_chain_sequences(structure)[chain_id]
-                start_idx = sequence.find(target_sequence)
+                match_position = self.find_best_sequence_match(sequence, target_sequence)
 
-                if start_idx == -1:
+                if match_position is None:
                     raise ValueError(f"Target sequence not found in chain {chain_id}")
 
-                logger.info(f"Found target sequence starting at position {start_idx}")
-                target_residues = residues[start_idx:start_idx + len(target_sequence)]
+                logger.info(f"Using sequence match at position {match_position}")
+                target_residues = residues[match_position:match_position + len(target_sequence)]
             else:
                 target_residues = residues
 
