@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default values
-PYTHON_SCRIPT="symmetric_channel_binder_rmsd.py"
+PYTHON_SCRIPT="compute_symmetric_channel_binder_rmsd.py"
 TARGET_SEQ="IPDAFWWAVVTMTTVGYGD"
 OUTPUT_FILE="analysis_results.csv"
 
@@ -97,7 +97,6 @@ extract_numbers() {
         model_num=$(echo "$filename" | grep -o '_[0-9]\+_sample_[0-9]\+_' | cut -d'_' -f2)
         sample_num=$(echo "$filename" | grep -o '_sample_[0-9]\+_' | cut -d'_' -f3)
     else  # AF3
-        # Updated pattern for AF3 CIF files
         model_num=$(echo "$filename" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f2)
         sample_num=$(echo "$filename" | grep -o '_[0-9]\+_[0-9]\+_' | cut -d'_' -f3)
     fi
@@ -132,12 +131,9 @@ process_model() {
     # Run the Python script and capture output
     output=$(python3 "$PYTHON_SCRIPT" \
         -refpdb "$reference_path" \
-        -refchanchain B \
-        -refbindchain A \
         -testpdb "$model_path" \
-        -testchanchain A \
-        -testbindchain B \
-        -targetseq "$TARGET_SEQ")
+        -targetseq "$TARGET_SEQ" \
+        -v)
 
     # Check if the Python script executed successfully
     if [ $? -ne 0 ]; then
@@ -162,7 +158,7 @@ find "$AF2_DIR" -type f -name "*.pdb" | while read -r model_path; do
     process_model "$model_path" "AF2"
 done
 
-# Process AF3 models (updated to look for CIF files)
+# Process AF3 models
 echo "Processing AF3 models..."
 find "$AF3_DIR" -type f -name "*.cif" | while read -r model_path; do
     process_model "$model_path" "AF3"

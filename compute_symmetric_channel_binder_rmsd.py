@@ -14,12 +14,19 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 @dataclass
+class ChainMapping:
+    channel_chain: str
+    binder_chain: str
+
+@dataclass
 class AnalysisResult:
     binder_rmsd: float
     channel_rmsd: float
     binder_length_ref: int
     binder_length_model: int
     channel_length: int
+    ref_mapping: ChainMapping
+    test_mapping: ChainMapping
 
 class ChannelBinderAnalyzer:
     def __init__(self, quiet: bool = True):
@@ -39,7 +46,6 @@ class ChannelBinderAnalyzer:
             else:
                 raise ValueError(f"Unsupported file format: {filepath}")
 
-            # Verify structure loaded successfully
             chain_count = len(list(structure[0]))
             logger.info(f"Successfully loaded structure with {chain_count} chains")
             return structure
@@ -47,8 +53,8 @@ class ChannelBinderAnalyzer:
             logger.error(f"Failed to load structure {filepath}: {str(e)}")
             raise
 
-    def list_chains_and_sequences(self, structure: PDB.Structure.Structure) -> Dict[str, str]:
-        """List all chains and their sequences in the structure."""
+    def get_chain_sequences(self, structure: PDB.Structure.Structure) -> Dict[str, str]:
+        """Get sequences for all chains in the structure."""
         three_to_one = {
             'ALA':'A', 'CYS':'C', 'ASP':'D', 'GLU':'E', 'PHE':'F',
             'GLY':'G', 'HIS':'H', 'ILE':'I', 'LYS':'K', 'LEU':'L',
@@ -65,45 +71,27 @@ class ChannelBinderAnalyzer:
             logger.info(f"Chain {chain.id} sequence length: {len(sequence)}")
         return sequences
 
-    def verify_chain_ids(self, structure: PDB.Structure.Structure, expected_chains: List[str]) -> bool:
-        """Verify that all expected chains exist in the structure."""
-        available_chains = set(chain.id for chain in structure[0])
-        logger.info(f"Available chains: {available_chains}")
-        logger.info(f"Expected chains: {expected_chains}")
+    def identify_chains(self, structure: PDB.Structure.Structure,
+                       target_sequence: str) -> ChainMapping:
+        """Identify channel and binder chains based on sequence content."""
+        sequences = self.get_chain_sequences(structure)
 
-        missing_chains = set(expected_chains) - available_chains
-        if missing_chains:
-            logger.error(f"Missing chains: {missing_chains}")
-            return False
-        return True
-
-    def find_matching_chain(self, structure: PDB.Structure.Structure,
-                          target_sequence: str,
-                          required_chain: Optional[str] = None) -> Optional[str]:
-        """Find chain containing target sequence, optionally verifying against required chain."""
-        sequences = self.list_chains_and_sequences(structure)
-
-        if required_chain:
-            if required_chain not in sequences:
-                logger.error(f"Required chain {required_chain} not found in structure")
-                return None
-
-            if target_sequence in sequences[required_chain]:
-                return required_chain
-            else:
-                logger.error(f"Target sequence not found in required chain {required_chain}")
-                logger.error(f"Chain {required_chain} sequence: {sequences[required_chain]}")
-                logger.error(f"Target sequence: {target_sequence}")
-                return None
-
-        # If no required chain, search all chains
+        # Find channel chain (contains target sequence)
+        channel_chain = None
         for chain_id, sequence in sequences.items():
             if target_sequence in sequence:
-                logger.info(f"Found target sequence in chain {chain_id}")
-                return chain_id
+                channel_chain = chain_id
+                logger.info(f"Found channel sequence in chain {chain_id}")
+                break
 
-        logger.error("Target sequence not found in any chain")
-        return None
+        if not channel_chain:
+            raise ValueError("Could not find channel sequence in any chain")
+
+        # The other chain must be the binder
+        binder_chain = next(chain_id for chain_id in sequences.keys() if chain_id != channel_chain)
+        logger.info(f"Using chain {binder_chain} as binder chain")
+
+        return ChainMapping(channel_chain=channel_chain, binder_chain=binder_chain)
 
     def get_ca_atoms(self, structure: PDB.Structure.Structure, chain_id: str,
                      target_sequence: Optional[str] = None) -> List[PDB.Atom.Atom]:
@@ -111,28 +99,14 @@ class ChannelBinderAnalyzer:
         logger.info(f"Getting CA atoms for chain {chain_id}")
 
         try:
-            if chain_id not in structure[0]:
-                raise ValueError(f"Chain {chain_id} not found in structure")
-
             chain = structure[0][chain_id]
             residues = list(filter(lambda r: r.id[0] == ' ', chain.get_residues()))
             logger.info(f"Found {len(residues)} standard residues in chain")
 
             if target_sequence:
-                three_to_one = {
-                    'ALA':'A', 'CYS':'C', 'ASP':'D', 'GLU':'E', 'PHE':'F',
-                    'GLY':'G', 'HIS':'H', 'ILE':'I', 'LYS':'K', 'LEU':'L',
-                    'MET':'M', 'ASN':'N', 'PRO':'P', 'GLN':'Q', 'ARG':'R',
-                    'SER':'S', 'THR':'T', 'VAL':'V', 'TRP':'W', 'TYR':'Y'
-                }
-
-                sequence = ''.join(three_to_one.get(res.get_resname().strip(), 'X')
-                                 for res in residues)
-
-                logger.info(f"Chain sequence: {sequence}")
-                logger.info(f"Target sequence: {target_sequence}")
-
+                sequence = self.get_chain_sequences(structure)[chain_id]
                 start_idx = sequence.find(target_sequence)
+
                 if start_idx == -1:
                     raise ValueError(f"Target sequence not found in chain {chain_id}")
 
@@ -161,32 +135,16 @@ class ChannelBinderAnalyzer:
     def analyze_structures(self,
                          ref_structure: PDB.Structure.Structure,
                          test_structure: PDB.Structure.Structure,
-                         ref_chan_chain: str,
-                         ref_bind_chain: str,
-                         test_chan_chain: str,
-                         test_bind_chain: str,
-                         target_sequence: Optional[str] = None) -> AnalysisResult:
+                         target_sequence: str) -> AnalysisResult:
         """Analyze a pair of structures and return their RMSD values."""
         try:
-            # Verify all chains exist
-            ref_chains = [ref_chan_chain, ref_bind_chain]
-            test_chains = [test_chan_chain, test_bind_chain]
-
-            if not self.verify_chain_ids(ref_structure, ref_chains):
-                raise ValueError("Missing required chains in reference structure")
-            if not self.verify_chain_ids(test_structure, test_chains):
-                raise ValueError("Missing required chains in test structure")
-
-            # Verify target sequence is present in channel chains if provided
-            if target_sequence:
-                if not self.find_matching_chain(ref_structure, target_sequence, ref_chan_chain):
-                    raise ValueError("Target sequence not found in reference channel chain")
-                if not self.find_matching_chain(test_structure, target_sequence, test_chan_chain):
-                    raise ValueError("Target sequence not found in test channel chain")
+            # Identify chains in both structures
+            ref_mapping = self.identify_chains(ref_structure, target_sequence)
+            test_mapping = self.identify_chains(test_structure, target_sequence)
 
             # Get CA atoms for channel alignment
-            ref_channel_ca = self.get_ca_atoms(ref_structure, ref_chan_chain, target_sequence)
-            test_channel_ca = self.get_ca_atoms(test_structure, test_chan_chain, target_sequence)
+            ref_channel_ca = self.get_ca_atoms(ref_structure, ref_mapping.channel_chain, target_sequence)
+            test_channel_ca = self.get_ca_atoms(test_structure, test_mapping.channel_chain, target_sequence)
 
             # Calculate and apply superposition
             logger.info("Performing superposition")
@@ -195,8 +153,8 @@ class ChannelBinderAnalyzer:
                 atom.set_coord(np.dot(atom.get_coord(), self.sup.rotran[0]) + self.sup.rotran[1])
 
             # Get binder atoms and calculate RMSD
-            binder_ref_atoms = self.get_ca_atoms(ref_structure, ref_bind_chain)
-            binder_test_atoms = self.get_ca_atoms(test_structure, test_bind_chain)
+            binder_ref_atoms = self.get_ca_atoms(ref_structure, ref_mapping.binder_chain)
+            binder_test_atoms = self.get_ca_atoms(test_structure, test_mapping.binder_chain)
 
             # Calculate RMSDs
             min_length = min(len(binder_ref_atoms), len(binder_test_atoms))
@@ -212,7 +170,9 @@ class ChannelBinderAnalyzer:
                 channel_rmsd=channel_rmsd,
                 binder_length_ref=len(binder_ref_atoms),
                 binder_length_model=len(binder_test_atoms),
-                channel_length=len(ref_channel_ca)
+                channel_length=len(ref_channel_ca),
+                ref_mapping=ref_mapping,
+                test_mapping=test_mapping
             )
 
         except Exception as e:
@@ -222,12 +182,8 @@ class ChannelBinderAnalyzer:
 def main():
     parser = argparse.ArgumentParser(description='Calculate RMSD between reference and test structures')
     parser.add_argument('-refpdb', required=True, help='Path to reference PDB/CIF file')
-    parser.add_argument('-refchanchain', required=True, help='Chain ID of channel in reference structure')
-    parser.add_argument('-refbindchain', required=True, help='Chain ID of binder in reference structure')
     parser.add_argument('-testpdb', required=True, help='Path to test PDB/CIF file')
-    parser.add_argument('-testchanchain', required=True, help='Chain ID of channel in test structure')
-    parser.add_argument('-testbindchain', required=True, help='Chain ID of binder in test structure')
-    parser.add_argument('-targetseq', help='Target sequence to align (optional)')
+    parser.add_argument('-targetseq', required=True, help='Target sequence for channel identification')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
     args = parser.parse_args()
 
@@ -244,15 +200,17 @@ def main():
         result = analyzer.analyze_structures(
             ref_structure=ref_structure,
             test_structure=test_structure,
-            ref_chan_chain=args.refchanchain,
-            ref_bind_chain=args.refbindchain,
-            test_chan_chain=args.testchanchain,
-            test_bind_chain=args.testbindchain,
             target_sequence=args.targetseq
         )
 
         # Print results
         print("\nAnalysis Results:")
+        print(f"Reference structure mapping:")
+        print(f"  Channel chain: {result.ref_mapping.channel_chain}")
+        print(f"  Binder chain: {result.ref_mapping.binder_chain}")
+        print(f"Test structure mapping:")
+        print(f"  Channel chain: {result.test_mapping.channel_chain}")
+        print(f"  Binder chain: {result.test_mapping.binder_chain}")
         print(f"Binder RMSD: {result.binder_rmsd:.2f}")
         print(f"Channel RMSD: {result.channel_rmsd:.2f}")
         print(f"Binder length (reference): {result.binder_length_ref}")
